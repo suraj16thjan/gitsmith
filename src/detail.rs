@@ -218,6 +218,29 @@ pub fn from_raw(kind: Kind, tab: Tab, v: &Value, now: DateTime<Utc>) -> Detail {
             }
             d
         }
+        (_, Tab::Members) => {
+            let user = match kind {
+                Kind::Glab => s(v, "username"),
+                Kind::Gh => s(v, "login"),
+            };
+            let mut d = Detail { title: user.clone(), ..Default::default() };
+            d.push("Name", s(v, "name"));
+            match kind {
+                Kind::Glab => {
+                    let level = v.get("access_level").and_then(Value::as_u64).unwrap_or(0);
+                    d.push("Role", crate::backend::role_name(level));
+                    d.push("State", s(v, "state"));
+                    d.push("Member since", rel("created_at"));
+                    d.push("Access expires", s(v, "expires_at"));
+                }
+                Kind::Gh => {
+                    d.push("Role", s(v, "role_name"));
+                    d.push("Type", s(v, "type"));
+                }
+            }
+            d.push("Profile", s(v, "web_url") + &s(v, "html_url"));
+            d
+        }
     }
 }
 

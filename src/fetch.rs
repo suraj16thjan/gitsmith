@@ -1,9 +1,9 @@
-use crate::backend::{Action, Backend, JobAction, Row, Tab};
+use crate::backend::{Action, Backend, JobAction, Kind, NewMr, Row, Tab};
 use std::sync::mpsc::Sender;
 use std::sync::Arc;
 
 pub enum Msg {
-    Fetched { tab: Tab, result: Result<Vec<Row>, String> },
+    Fetched { tab: Tab, page: u32, result: Result<Vec<Row>, String> },
     Acted { tab: Tab, result: Result<(), String> },
     Diff { result: Result<String, String> },
     Comments { result: Result<String, String> },
@@ -11,12 +11,43 @@ pub enum Msg {
     JobLog { result: Result<String, String> },
     JobActed { result: Result<(), String> },
     Repos { result: Result<Vec<String>, String> },
+    /// Hosts the chosen CLI is configured for, and where that list came from.
+    Hosts { kind: Kind, hosts: Vec<String>, origin: String },
+    /// A newly opened MR/PR or issue: the CLI's output (its URL) or the failure.
+    Created { result: Result<String, String> },
+    /// Branch names for the new-MR form.
+    Branches { result: Result<Vec<String>, String> },
 }
 
-pub fn spawn(backend: Arc<dyn Backend>, tab: Tab, tx: Sender<Msg>) {
+pub fn spawn(backend: Arc<dyn Backend>, tab: Tab, page: u32, tx: Sender<Msg>) {
     std::thread::spawn(move || {
-        let result = backend.list(tab).map_err(|e| format!("{e:#}"));
-        let _ = tx.send(Msg::Fetched { tab, result });
+        let result = backend.list(tab, page).map_err(|e| format!("{e:#}"));
+        let _ = tx.send(Msg::Fetched { tab, page, result });
+    });
+}
+
+/// Branch names for the new-MR form's source/target dropdowns.
+pub fn spawn_branches(backend: Arc<dyn Backend>, tx: Sender<Msg>) {
+    std::thread::spawn(move || {
+        let result = backend
+            .list(Tab::Branches, 1)
+            .map(|rows| rows.into_iter().map(|r| r.id).filter(|b| !b.is_empty()).collect())
+            .map_err(|e| format!("{e:#}"));
+        let _ = tx.send(Msg::Branches { result });
+    });
+}
+
+pub fn spawn_add_member(backend: Arc<dyn Backend>, user: String, role: String, tx: Sender<Msg>) {
+    std::thread::spawn(move || {
+        let result = backend.add_member(&user, &role).map_err(|e| format!("{e:#}"));
+        let _ = tx.send(Msg::Created { result });
+    });
+}
+
+pub fn spawn_create_issue(backend: Arc<dyn Backend>, title: String, body: String, tx: Sender<Msg>) {
+    std::thread::spawn(move || {
+        let result = backend.create_issue(&title, &body).map_err(|e| format!("{e:#}"));
+        let _ = tx.send(Msg::Created { result });
     });
 }
 
@@ -69,6 +100,21 @@ pub fn spawn_job_act(backend: Arc<dyn Backend>, action: JobAction, job_id: Strin
     });
 }
 
+pub fn spawn_create_mr(backend: Arc<dyn Backend>, mr: NewMr, tx: Sender<Msg>) {
+    std::thread::spawn(move || {
+        let result = backend.create_mr(&mr).map_err(|e| format!("{e:#}"));
+        let _ = tx.send(Msg::Created { result });
+    });
+}
+
+/// `auth status` shells out and talks to the host, so it runs off the UI thread.
+pub fn spawn_hosts(kind: Kind, tx: Sender<Msg>) {
+    std::thread::spawn(move || {
+        let found = crate::backend::auth_hosts(kind);
+        let _ = tx.send(Msg::Hosts { kind, hosts: found.hosts, origin: found.origin });
+    });
+}
+
 pub fn spawn_repos(backend: Arc<dyn Backend>, tx: Sender<Msg>) {
     std::thread::spawn(move || {
         let result = backend.repos().map_err(|e| format!("{e:#}"));
@@ -84,7 +130,7 @@ mod tests {
 
     struct FakeOk;
     impl Backend for FakeOk {
-        fn list(&self, _tab: Tab) -> anyhow::Result<Vec<Row>> {
+        fn list(&self, _tab: Tab, _page: u32) -> anyhow::Result<Vec<Row>> {
             Ok(vec![Row { id: String::new(), cells: vec!["x".into()], web_url: String::new(), raw: serde_json::Value::Null }])
         }
 
@@ -119,7 +165,7 @@ mod tests {
 
     struct FakeErr;
     impl Backend for FakeErr {
-        fn list(&self, _tab: Tab) -> anyhow::Result<Vec<Row>> {
+        fn list(&self, _tab: Tab, _page: u32) -> anyhow::Result<Vec<Row>> {
             anyhow::bail!("boom")
         }
 
@@ -131,9 +177,10 @@ mod tests {
     #[test]
     fn spawn_delivers_fetched_ok() {
         let (tx, rx) = mpsc::channel();
-        spawn(Arc::new(FakeOk), Tab::Issues, tx);
+        spawn(Arc::new(FakeOk), Tab::Issues, 1, tx);
         match rx.recv().unwrap() {
-            Msg::Fetched { tab, result } => {
+            Msg::Fetched { tab, page, result } => {
+                assert_eq!(page, 1);
                 assert_eq!(tab, Tab::Issues);
                 assert_eq!(result.unwrap().len(), 1);
             }
@@ -144,7 +191,7 @@ mod tests {
     #[test]
     fn spawn_delivers_err_as_string() {
         let (tx, rx) = mpsc::channel();
-        spawn(Arc::new(FakeErr), Tab::Runners, tx);
+        spawn(Arc::new(FakeErr), Tab::Runners, 1, tx);
         match rx.recv().unwrap() {
             Msg::Fetched { result, .. } => assert_eq!(result.unwrap_err(), "boom"),
             _ => panic!("expected Fetched"),

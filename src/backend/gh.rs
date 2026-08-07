@@ -1,5 +1,5 @@
-use crate::backend::json::{nested_str, num, s};
-use crate::backend::{Backend, Row, Tab};
+use crate::backend::json::{join, nested_str, num, s};
+use crate::backend::{Backend, NewMr, Row, Tab};
 use crate::format::relative_time_str;
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
@@ -13,6 +13,7 @@ fn to_row(tab: Tab, v: &Value, now: DateTime<Utc>) -> Row {
         Tab::Issues | Tab::MergeRequests => vec![
             num(v, "number"),
             s(v, "title"),
+            join(v, "labels", Some("name")), // GitHub labels are objects
             s(v, "state"),
             nested_str(v, "user", "login"),
             updated,
@@ -31,6 +32,9 @@ fn to_row(tab: Tab, v: &Value, now: DateTime<Utc>) -> Row {
         ],
         Tab::Branches => vec![
             s(v, "name"),
+            // GitHub's branch list carries only name/sha/protected — no author.
+            // Left blank rather than costing one API call per branch.
+            String::new(),
             protected_label(v),
             nested_str(v, "commit", "sha").chars().take(8).collect(),
         ],
@@ -46,6 +50,7 @@ fn to_row(tab: Tab, v: &Value, now: DateTime<Utc>) -> Row {
             relative_time_str(&s(v, "updated_at"), now),
         ],
         Tab::Milestones => vec![s(v, "title"), s(v, "state"), s(v, "due_on")],
+        Tab::Members => vec![s(v, "login"), String::new(), gh_role(v), s(v, "type")],
     };
     let id = match tab {
         Tab::Issues | Tab::MergeRequests => num(v, "number"),
@@ -54,8 +59,25 @@ fn to_row(tab: Tab, v: &Value, now: DateTime<Utc>) -> Row {
         Tab::Tags | Tab::Branches => s(v, "name"),
         Tab::Commits => s(v, "sha"),
         Tab::Milestones => num(v, "number"),
+        Tab::Members => s(v, "login"),
     };
     Row { id, cells, web_url: s(v, "html_url"), raw: v.clone() }
+}
+
+/// A collaborator's role: `role_name` when the API sends it, else the strongest
+/// permission flag it did send.
+fn gh_role(v: &Value) -> String {
+    let role = s(v, "role_name");
+    if !role.is_empty() {
+        return role;
+    }
+    let perm = |k: &str| v.get("permissions").and_then(|p| p.get(k)).and_then(Value::as_bool) == Some(true);
+    for (flag, name) in [("admin", "admin"), ("maintain", "maintain"), ("push", "write"), ("triage", "triage")] {
+        if perm(flag) {
+            return name.to_string();
+        }
+    }
+    "read".to_string()
 }
 
 /// "protected" (for coloring) when a branch is protected, else "".
@@ -84,14 +106,24 @@ fn array_of(tab: Tab, value: &Value) -> Option<&Vec<Value>> {
 pub fn parse(tab: Tab, json: &str, now: DateTime<Utc>) -> Result<Vec<Row>> {
     let value: Value = serde_json::from_str(json).context("invalid JSON from gh")?;
     let arr = array_of(tab, &value).context("expected a JSON array from gh")?;
-    Ok(arr.iter().map(|v| to_row(tab, v, now)).collect())
+    let mut rows: Vec<Row> = arr
+        .iter()
+        // GitHub's issues endpoint also returns pull requests; they have their
+        // own tab, and listing them twice makes the numbering look wrong.
+        .filter(|v| tab != Tab::Issues || v.get("pull_request").is_none())
+        .map(|v| to_row(tab, v, now))
+        .collect();
+    crate::backend::sort_rows(tab, &mut rows);
+    Ok(rows)
 }
 
 fn gh_path(tab: Tab) -> &'static str {
     // ponytail: relies on gh's current-repo detection; add owner/repo override later.
     match tab {
-        Tab::Issues => "repos/{owner}/{repo}/issues",
-        Tab::MergeRequests => "repos/{owner}/{repo}/pulls",
+        // Both endpoints default to open only; closed items are the ones you'd
+        // want to reopen, so ask for every state.
+        Tab::Issues => "repos/{owner}/{repo}/issues?state=all",
+        Tab::MergeRequests => "repos/{owner}/{repo}/pulls?state=all",
         Tab::Pipelines => "repos/{owner}/{repo}/actions/runs",
         Tab::Runners => "repos/{owner}/{repo}/actions/runners",
         Tab::Releases => "repos/{owner}/{repo}/releases",
@@ -100,6 +132,7 @@ fn gh_path(tab: Tab) -> &'static str {
         Tab::Commits => "repos/{owner}/{repo}/commits",
         Tab::Todos => "notifications",
         Tab::Milestones => "repos/{owner}/{repo}/milestones",
+        Tab::Members => "repos/{owner}/{repo}/collaborators",
     }
 }
 
@@ -141,13 +174,39 @@ fn gh_job_log_args(job_id: &str) -> Vec<String> {
     owned(&["run", "view", "--job", job_id, "--log"])
 }
 
+/// `gh pr create` args. Passing both title and body keeps gh non-interactive.
+fn gh_create_args(mr: &NewMr) -> Vec<String> {
+    let mut args = owned(&["pr", "create", "--title", &mr.title, "--body", &mr.description]);
+    if !mr.source.is_empty() {
+        args.push("--head".into());
+        args.push(mr.source.clone());
+    }
+    if !mr.target.is_empty() {
+        args.push("--base".into());
+        args.push(mr.target.clone());
+    }
+    args
+}
+
+/// `gh issue create` args. Title and body together keep gh non-interactive.
+fn gh_issue_create_args(title: &str, description: &str) -> Vec<String> {
+    owned(&["issue", "create", "--title", title, "--body", description])
+}
+
 fn gh_job_retry_args(job_id: &str) -> Vec<String> {
     owned(&["run", "rerun", "--job", job_id])
 }
 
+/// Add paging query params to a REST path — every endpoint gitsmith lists is a
+/// paginated collection.
+fn paged_path(path: &str, page: u32) -> String {
+    let sep = if path.contains('?') { '&' } else { '?' };
+    format!("{path}{sep}per_page={}&page={page}", crate::backend::PER_PAGE)
+}
+
 impl Backend for GhBackend {
-    fn list(&self, tab: Tab) -> Result<Vec<Row>> {
-        let out = crate::backend::run("gh", &["api", gh_path(tab)])?;
+    fn list(&self, tab: Tab, page: u32) -> Result<Vec<Row>> {
+        let out = crate::backend::run("gh", &["api", &paged_path(gh_path(tab), page)])?;
         parse(tab, &out, Utc::now())
     }
 
@@ -204,8 +263,42 @@ impl Backend for GhBackend {
     }
 
     fn repos(&self) -> Result<Vec<String>> {
+        // The repo list is account-wide, so it must NOT be scoped to a repo.
         let out = crate::backend::run("gh", &["repo", "list", "--limit", "200", "--json", "nameWithOwner"])?;
         Ok(parse_repos_gh(&out))
+    }
+
+    fn create_mr(&self, mr: &NewMr) -> Result<String> {
+        // `gh pr create` works without a checkout (unlike glab's), but with no
+        // --head and no current branch it would fall back to prompting, which
+        // would hang the TUI. Resolve the branch here or say why we can't.
+        let source = if mr.source.is_empty() {
+            crate::backend::current_branch().context(
+                "no source branch — fill in the Source branch field (there's no checkout here)",
+            )?
+        } else {
+            mr.source.clone()
+        };
+        let args = gh_create_args(&NewMr { source, ..mr.clone() });
+        let argv: Vec<&str> = args.iter().map(String::as_str).collect();
+        let out = crate::backend::run("gh", &argv)?;
+        Ok(crate::backend::created_url(&out))
+    }
+
+    fn add_member(&self, user: &str, role: &str) -> Result<String> {
+        // GitHub invites by username directly; the role is its permission name.
+        let path = format!("repos/{{owner}}/{{repo}}/collaborators/{user}");
+        let args = owned(&["api", "--method", "PUT", &path, "-f", &format!("permission={role}")]);
+        let argv: Vec<&str> = args.iter().map(String::as_str).collect();
+        crate::backend::run("gh", &argv)?;
+        Ok(format!("{user} invited as {role}"))
+    }
+
+    fn create_issue(&self, title: &str, description: &str) -> Result<String> {
+        let args = gh_issue_create_args(title, description);
+        let argv: Vec<&str> = args.iter().map(String::as_str).collect();
+        let out = crate::backend::run("gh", &argv)?;
+        Ok(crate::backend::created_url(&out))
     }
 
     fn commit_diff(&self, sha: &str) -> Result<String> {
@@ -238,15 +331,116 @@ mod tests {
     }
 
     #[test]
+    fn parses_collaborators_with_their_role() {
+        // role_name when the API sends it…
+        let json = r#"[{"login":"alice","role_name":"admin","type":"User"}]"#;
+        let rows = parse(Tab::Members, json, now()).unwrap();
+        assert_eq!(rows[0].id, "alice");
+        assert_eq!(rows[0].cells, vec!["alice", "", "admin", "User"]);
+
+        // …else the strongest permission flag it did send
+        let json = r#"[{"login":"bob","permissions":{"push":true,"pull":true},"type":"User"}]"#;
+        let rows = parse(Tab::Members, json, now()).unwrap();
+        assert_eq!(rows[0].cells[2], "write");
+
+        let json = r#"[{"login":"carol","permissions":{"pull":true},"type":"User"}]"#;
+        let rows = parse(Tab::Members, json, now()).unwrap();
+        assert_eq!(rows[0].cells[2], "read");
+    }
+
+    #[test]
+    fn pr_create_never_relies_on_a_prompt() {
+        // both title and body are always passed, so gh can't stop to ask
+        let bare = NewMr { title: "T".into(), ..Default::default() };
+        let args = gh_create_args(&bare);
+        assert!(args.contains(&"--title".to_string()) && args.contains(&"--body".to_string()));
+        assert_eq!(gh_issue_create_args("T", ""), vec!["issue", "create", "--title", "T", "--body", ""]);
+        // a resolved head branch is passed explicitly rather than inferred
+        let with_head = NewMr { source: "feat/x".into(), title: "T".into(), ..Default::default() };
+        let args = gh_create_args(&with_head);
+        assert_eq!(args.iter().position(|a| a == "--head").map(|i| &args[i + 1]), Some(&"feat/x".to_string()));
+    }
+
+    #[test]
+    fn paging_adds_query_params() {
+        assert_eq!(paged_path("repos/o/r/branches", 2), "repos/o/r/branches?per_page=100&page=2");
+        assert_eq!(paged_path("notifications?all=true", 1), "notifications?all=true&per_page=100&page=1");
+    }
+
+    #[test]
+    fn issue_create_args_are_non_interactive() {
+        assert_eq!(
+            gh_issue_create_args("Broken", "steps to repro"),
+            vec!["issue", "create", "--title", "Broken", "--body", "steps to repro"]
+        );
+    }
+
+    #[test]
+    fn create_args_are_non_interactive() {
+        let mr = NewMr {
+            source: "feature/x".into(),
+            target: "main".into(),
+            title: "Add x".into(),
+            description: "why x".into(),
+        };
+        assert_eq!(
+            gh_create_args(&mr),
+            vec!["pr", "create", "--title", "Add x", "--body", "why x", "--head", "feature/x", "--base", "main"]
+        );
+        let bare = NewMr { title: "T".into(), ..Default::default() };
+        assert_eq!(gh_create_args(&bare), vec!["pr", "create", "--title", "T", "--body", ""]);
+    }
+
+    #[test]
+    fn pull_requests_are_kept_out_of_the_issues_tab() {
+        // GitHub's issues endpoint returns PRs too — they have their own tab
+        let json = r#"[
+          {"number":5,"title":"a real issue","state":"open","updated_at":"2026-07-30T09:00:00Z"},
+          {"number":6,"title":"actually a PR","state":"open","updated_at":"2026-07-31T09:00:00Z",
+           "pull_request":{"url":"https://api.github.com/repos/o/r/pulls/6"}}
+        ]"#;
+        let rows = parse(Tab::Issues, json, now()).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, "5");
+        // …but the MRs/PRs tab still lists everything it's given
+        let rows = parse(Tab::MergeRequests, json, now()).unwrap();
+        assert_eq!(rows.len(), 2);
+    }
+
+    #[test]
+    fn every_state_is_requested() {
+        // closed items must come back, or there's nothing to reopen
+        assert!(gh_path(Tab::Issues).contains("state=all"));
+        assert!(gh_path(Tab::MergeRequests).contains("state=all"));
+        // and paging still appends correctly onto that query
+        assert_eq!(
+            paged_path(gh_path(Tab::Issues), 2),
+            "repos/{owner}/{repo}/issues?state=all&per_page=100&page=2"
+        );
+    }
+
+    #[test]
+    fn parse_orders_rows_newest_first() {
+        let json = r#"[
+          {"number":1,"title":"old","updated_at":"2026-07-01T09:00:00Z"},
+          {"number":3,"title":"newest","updated_at":"2026-07-30T09:00:00Z"},
+          {"number":2,"title":"middle","updated_at":"2026-07-20T09:00:00Z"}
+        ]"#;
+        let rows = parse(Tab::Issues, json, now()).unwrap();
+        assert_eq!(rows.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(), ["3", "2", "1"]);
+    }
+
+    #[test]
     fn parses_pulls() {
         let json = r#"[
           {"number":42,"title":"Add feature","state":"open",
+           "labels":[{"name":"enhancement"},{"name":"p1"}],
            "user":{"login":"bob"},"updated_at":"2026-07-30T11:30:00Z",
            "html_url":"https://github.com/o/r/pull/42"}
         ]"#;
         let rows = parse(Tab::MergeRequests, json, now()).unwrap();
         assert_eq!(rows[0].id, "42");
-        assert_eq!(rows[0].cells, vec!["42", "Add feature", "open", "bob", "30m ago"]);
+        assert_eq!(rows[0].cells, vec!["42", "Add feature", "enhancement, p1", "open", "bob", "30m ago"]);
         assert_eq!(rows[0].web_url, "https://github.com/o/r/pull/42");
         // raw JSON is retained for the detail view
         assert_eq!(rows[0].raw["title"], "Add feature");
@@ -299,7 +493,8 @@ mod tests {
     fn parses_branches_and_commits() {
         let b = parse(Tab::Branches, r#"[{"name":"main","protected":true,"commit":{"sha":"deadbeef1234"}}]"#, now()).unwrap();
         assert_eq!(b[0].id, "main");
-        assert_eq!(b[0].cells, vec!["main", "protected", "deadbeef"]);
+        // GitHub's branch list has no author, so the owner column stays blank
+        assert_eq!(b[0].cells, vec!["main", "", "protected", "deadbeef"]);
 
         let c = parse(Tab::Commits, r#"[{"sha":"abc123def456","commit":{"message":"fix: bug\n\nbody","author":{"name":"bob","date":"2026-07-30T11:30:00Z"}}}]"#, now()).unwrap();
         assert_eq!(c[0].id, "abc123def456"); // full sha for the diff

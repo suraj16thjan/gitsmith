@@ -1,5 +1,5 @@
-use crate::backend::json::{nested_str, num, s};
-use crate::backend::{Backend, Row, Tab};
+use crate::backend::json::{join, nested_str, num, s};
+use crate::backend::{Backend, NewMr, Row, Tab};
 use crate::format::relative_time_str;
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
@@ -13,6 +13,7 @@ fn to_row(tab: Tab, v: &Value, now: DateTime<Utc>) -> Row {
         Tab::Issues | Tab::MergeRequests => vec![
             num(v, "iid"),
             s(v, "title"),
+            join(v, "labels", None), // GitLab labels are plain strings
             s(v, "state"),
             nested_str(v, "author", "username"),
             updated,
@@ -31,6 +32,9 @@ fn to_row(tab: Tab, v: &Value, now: DateTime<Utc>) -> Row {
         ],
         Tab::Branches => vec![
             s(v, "name"),
+            // Branches have no owner of their own; whoever last committed on it
+            // is who you'd go ask about it.
+            nested_str(v, "commit", "author_name"),
             protected_label(v),
             nested_str(v, "commit", "short_id"),
         ],
@@ -46,6 +50,12 @@ fn to_row(tab: Tab, v: &Value, now: DateTime<Utc>) -> Row {
             updated,
         ],
         Tab::Milestones => vec![s(v, "title"), s(v, "state"), s(v, "due_date")],
+        Tab::Members => vec![
+            s(v, "username"),
+            s(v, "name"),
+            crate::backend::role_name(v.get("access_level").and_then(Value::as_u64).unwrap_or(0)),
+            s(v, "state"),
+        ],
     };
     let id = match tab {
         Tab::Issues | Tab::MergeRequests | Tab::Milestones => num(v, "iid"),
@@ -53,6 +63,7 @@ fn to_row(tab: Tab, v: &Value, now: DateTime<Utc>) -> Row {
         Tab::Releases => s(v, "tag_name"),
         Tab::Tags | Tab::Branches => s(v, "name"),
         Tab::Commits => s(v, "id"), // full sha, for the commit diff
+        Tab::Members => s(v, "username"),
     };
     Row { id, cells, web_url: s(v, "web_url"), raw: v.clone() }
 }
@@ -74,7 +85,9 @@ fn first_line(s: &str) -> String {
 pub fn parse(tab: Tab, json: &str, now: DateTime<Utc>) -> Result<Vec<Row>> {
     let value: Value = serde_json::from_str(json).context("invalid JSON from glab")?;
     let arr = value.as_array().context("expected a JSON array from glab")?;
-    Ok(arr.iter().map(|v| to_row(tab, v, now)).collect())
+    let mut rows: Vec<Row> = arr.iter().map(|v| to_row(tab, v, now)).collect();
+    crate::backend::sort_rows(tab, &mut rows);
+    Ok(rows)
 }
 
 /// Extract a GitLab project path (`group/subgroup/repo`) from a git remote URL.
@@ -148,6 +161,72 @@ fn glab_comment_args(id: &str, body: &str) -> Vec<String> {
     owned(&["issue", "note", id, "-m", body])
 }
 
+/// POST args for creating a merge request through the REST API.
+///
+/// `glab mr create` is not usable here: it shells out to git and fails with
+/// "not a git repository" whenever gitsmith runs outside a checkout — which is
+/// exactly the case the repo picker exists for. The API needs no local repo,
+/// never prompts, and never opens $EDITOR. `-f` (raw-field) keeps every value a
+/// literal string, so a title of "123" or "@notes" is sent as typed.
+fn glab_mr_api_args(project: &str, source: &str, target: &str, mr: &NewMr) -> Vec<String> {
+    let path = format!("projects/{}/merge_requests", encode_project(project));
+    owned(&[
+        "api",
+        "--method",
+        "POST",
+        &path,
+        "-f",
+        &format!("source_branch={source}"),
+        "-f",
+        &format!("target_branch={target}"),
+        "-f",
+        &format!("title={}", mr.title),
+        "-f",
+        &format!("description={}", mr.description),
+    ])
+}
+
+/// POST args for creating an issue — same reasoning as [`glab_mr_api_args`].
+fn glab_issue_api_args(project: &str, title: &str, description: &str) -> Vec<String> {
+    let path = format!("projects/{}/issues", encode_project(project));
+    owned(&[
+        "api",
+        "--method",
+        "POST",
+        &path,
+        "-f",
+        &format!("title={title}"),
+        "-f",
+        &format!("description={description}"),
+    ])
+}
+
+/// Look up a user's numeric id by username — any instance answers `/users`.
+fn user_id(username: &str) -> Result<u64> {
+    let out = glab_run(&["api", &format!("users?username={username}")])?;
+    let value: Value = serde_json::from_str(&out).context("could not read the user list")?;
+    value
+        .as_array()
+        .and_then(|a| a.first())
+        .and_then(|u| u.get("id"))
+        .and_then(Value::as_u64)
+        .with_context(|| format!("no user named `{username}` on this host"))
+}
+
+/// The project's default branch, for when the form leaves Target blank. Every
+/// instance answers this on the project endpoint, so nothing here is host- or
+/// account-specific.
+fn default_branch(project: &str) -> Result<String> {
+    let path = format!("projects/{}", encode_project(project));
+    let out = glab_run(&["api", &path])?;
+    let value: Value = serde_json::from_str(&out).context("could not read the project")?;
+    let branch = s(&value, "default_branch");
+    if branch.is_empty() {
+        anyhow::bail!("could not determine the default branch — fill in the Target branch field");
+    }
+    Ok(branch)
+}
+
 fn glab_diff_args(id: &str) -> Vec<String> {
     owned(&["mr", "diff", id])
 }
@@ -180,18 +259,38 @@ fn glab_job_act_path(enc_project: &str, job_id: &str, action: crate::backend::Jo
     format!("projects/{enc_project}/jobs/{job_id}/{verb}")
 }
 
+/// Add paging to a `glab` invocation: query params for raw `api` paths, flags
+/// for the list subcommands (both accept `--per-page` / `--page`).
+fn paged(mut args: Vec<String>, page: u32) -> Vec<String> {
+    let per = crate::backend::PER_PAGE;
+    if args.first().map(String::as_str) == Some("api") {
+        if let Some(path) = args.get_mut(1) {
+            let sep = if path.contains('?') { '&' } else { '?' };
+            path.push_str(&format!("{sep}per_page={per}&page={page}"));
+        }
+    } else {
+        args.push("--per-page".into());
+        args.push(per.to_string());
+        args.push("--page".into());
+        args.push(page.to_string());
+    }
+    args
+}
+
 impl Backend for GlabBackend {
-    fn list(&self, tab: Tab) -> Result<Vec<Row>> {
+    fn list(&self, tab: Tab, page: u32) -> Result<Vec<Row>> {
         // High-level `glab <res> list --output json` subcommands resolve the
         // current repo's project and emit the raw API JSON array the parser
         // consumes. `glab api projects/...` is avoided (placeholder substitution
         // is unreliable on self-hosted hosts); `todos` has no project scope so it
         // stays on the api endpoint; `milestone list` is the one subcommand that
         // does NOT auto-resolve the repo, so it needs an explicit --project.
-        // ponytail: defaults to open items / first page; add state+pagination later.
+        // ponytail: defaults to open items; `page` walks the rest in the background.
         let args = match tab {
-            Tab::Issues => owned(&["issue", "list", "--output", "json"]),
-            Tab::MergeRequests => owned(&["mr", "list", "--output", "json"]),
+            // `--all` covers every state: an issue you want to reopen is closed,
+            // and the default listing hides exactly those.
+            Tab::Issues => owned(&["issue", "list", "--all", "--output", "json"]),
+            Tab::MergeRequests => owned(&["mr", "list", "--all", "--output", "json"]),
             Tab::Pipelines => owned(&["ci", "list", "--output", "json"]),
             Tab::Runners => owned(&["runner", "list", "--output", "json"]),
             Tab::Releases => owned(&["release", "list", "--output", "json"]),
@@ -208,6 +307,12 @@ impl Backend for GlabBackend {
                 format!("projects/{}/repository/commits", encode_project(&current_project()?)),
             ],
             Tab::Todos => owned(&["api", "todos"]),
+            // `members/all` includes group-inherited access, which is what
+            // "who can touch this project" actually means.
+            Tab::Members => vec![
+                "api".into(),
+                format!("projects/{}/members/all", encode_project(&current_project()?)),
+            ],
             Tab::Milestones => vec![
                 "milestone".into(),
                 "list".into(),
@@ -217,6 +322,7 @@ impl Backend for GlabBackend {
                 "json".into(),
             ],
         };
+        let args = paged(args, page);
         let argv: Vec<&str> = args.iter().map(String::as_str).collect();
         let out = glab_run(&argv)?;
         parse(tab, &out, Utc::now())
@@ -292,6 +398,51 @@ impl Backend for GlabBackend {
         Ok(parse_repos_glab(&out))
     }
 
+    fn create_mr(&self, mr: &NewMr) -> Result<String> {
+        let project = current_project()?;
+        // The API needs both branches spelled out; the form's blanks mean
+        // "the branch I'm on" and "wherever this project merges by default".
+        let source = if mr.source.is_empty() {
+            crate::backend::current_branch().context(
+                "no source branch — fill in the Source branch field (there's no checkout here)",
+            )?
+        } else {
+            mr.source.clone()
+        };
+        let target = if mr.target.is_empty() { default_branch(&project)? } else { mr.target.clone() };
+        let args = glab_mr_api_args(&project, &source, &target, mr);
+        let argv: Vec<&str> = args.iter().map(String::as_str).collect();
+        Ok(crate::backend::created_url(&glab_run(&argv)?))
+    }
+
+    fn add_member(&self, user: &str, role: &str) -> Result<String> {
+        let project = current_project()?;
+        let level = crate::backend::access_level(role)
+            .with_context(|| format!("unknown role `{role}`"))?;
+        // GitLab's members API takes a numeric user id, not a username.
+        let id = user_id(user)?;
+        let path = format!("projects/{}/members", encode_project(&project));
+        let args = owned(&[
+            "api",
+            "--method",
+            "POST",
+            &path,
+            "-f",
+            &format!("user_id={id}"),
+            "-f",
+            &format!("access_level={level}"),
+        ]);
+        let argv: Vec<&str> = args.iter().map(String::as_str).collect();
+        glab_run(&argv)?;
+        Ok(format!("{user} added as {role}"))
+    }
+
+    fn create_issue(&self, title: &str, description: &str) -> Result<String> {
+        let args = glab_issue_api_args(&current_project()?, title, description);
+        let argv: Vec<&str> = args.iter().map(String::as_str).collect();
+        Ok(crate::backend::created_url(&glab_run(&argv)?))
+    }
+
     fn commit_diff(&self, sha: &str) -> Result<String> {
         let enc = encode_project(&current_project()?);
         let out = crate::backend::run("glab", &["api", &format!("projects/{enc}/repository/commits/{sha}/diff")])?;
@@ -341,24 +492,112 @@ mod tests {
     #[test]
     fn parses_issues() {
         let json = r#"[
-          {"iid":7,"title":"Bug in parser","state":"opened",
+          {"iid":7,"title":"Bug in parser","state":"opened","labels":["bug","ui"],
            "author":{"username":"alice"},"updated_at":"2026-07-30T09:00:00Z",
            "web_url":"https://gitlab.com/o/r/-/issues/7"}
         ]"#;
         let rows = parse(Tab::Issues, json, now()).unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].id, "7");
-        assert_eq!(rows[0].cells, vec!["7", "Bug in parser", "opened", "alice", "3h ago"]);
+        assert_eq!(rows[0].cells, vec!["7", "Bug in parser", "bug, ui", "opened", "alice", "3h ago"]);
         assert_eq!(rows[0].web_url, "https://gitlab.com/o/r/-/issues/7");
         // raw JSON is retained for the detail view
         assert_eq!(rows[0].raw["title"], "Bug in parser");
     }
 
     #[test]
+    fn every_state_is_requested() {
+        // `--all` is what makes closed issues (the reopenable ones) show up
+        let args = paged(owned(&["issue", "list", "--all", "--output", "json"]), 1);
+        assert!(args.contains(&"--all".to_string()));
+        assert!(args.contains(&"--per-page".to_string()));
+    }
+
+    #[test]
+    fn paging_uses_flags_or_query_params() {
+        // raw api paths take query params...
+        assert_eq!(
+            paged(vec!["api".into(), "projects/1/repository/branches".into()], 2),
+            vec!["api", "projects/1/repository/branches?per_page=100&page=2"]
+        );
+        // ...appended correctly when the path already has a query
+        assert_eq!(
+            paged(vec!["api".into(), "todos?state=pending".into()], 1),
+            vec!["api", "todos?state=pending&per_page=100&page=1"]
+        );
+        // list subcommands take flags
+        assert_eq!(
+            paged(owned(&["issue", "list", "--output", "json"]), 3),
+            vec!["issue", "list", "--output", "json", "--per-page", "100", "--page", "3"]
+        );
+    }
+
+    #[test]
+    fn parses_members_with_their_role() {
+        let json = r#"[
+          {"id":7,"username":"alice","name":"Alice A","state":"active","access_level":40},
+          {"id":8,"username":"bob","name":"Bob B","state":"blocked","access_level":10}
+        ]"#;
+        let rows = parse(Tab::Members, json, now()).unwrap();
+        assert_eq!(rows[0].id, "alice");
+        assert_eq!(rows[0].cells, vec!["alice", "Alice A", "Maintainer", "active"]);
+        assert_eq!(rows[1].cells, vec!["bob", "Bob B", "Guest", "blocked"]);
+    }
+
+    #[test]
+    fn create_goes_through_the_api_not_the_git_aware_subcommand() {
+        let mr = NewMr {
+            source: "feature/x".into(),
+            target: "main".into(),
+            title: "Add x".into(),
+            description: "why x".into(),
+        };
+        // nested groups are encoded, so this works on any instance layout
+        assert_eq!(
+            glab_mr_api_args("group/sub/proj", "feature/x", "main", &mr),
+            vec![
+                "api", "--method", "POST", "projects/group%2Fsub%2Fproj/merge_requests",
+                "-f", "source_branch=feature/x",
+                "-f", "target_branch=main",
+                "-f", "title=Add x",
+                "-f", "description=why x",
+            ]
+        );
+        assert_eq!(
+            glab_issue_api_args("o/r", "Broken", "steps"),
+            vec!["api", "--method", "POST", "projects/o%2Fr/issues", "-f", "title=Broken", "-f", "description=steps"]
+        );
+    }
+
+    #[test]
+    fn values_are_passed_through_literally() {
+        // spaces, newlines, '=' and a leading '@' must survive as typed
+        let mr = NewMr {
+            title: "fix: a=b @ 50% off".into(),
+            description: "line one\nline two".into(),
+            ..Default::default()
+        };
+        let args = glab_mr_api_args("o/r", "s", "t", &mr);
+        assert!(args.contains(&"title=fix: a=b @ 50% off".to_string()));
+        assert!(args.contains(&"description=line one\nline two".to_string()));
+    }
+
+    #[test]
+    fn parse_orders_rows_newest_first() {
+        let json = r#"[
+          {"iid":1,"title":"old","updated_at":"2026-07-01T09:00:00Z"},
+          {"iid":3,"title":"newest","updated_at":"2026-07-30T09:00:00Z"},
+          {"iid":2,"title":"middle","updated_at":"2026-07-20T09:00:00Z"}
+        ]"#;
+        let rows = parse(Tab::Issues, json, now()).unwrap();
+        assert_eq!(rows.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(), ["3", "2", "1"]);
+    }
+
+    #[test]
     fn missing_fields_degrade_to_empty() {
         let rows = parse(Tab::Issues, r#"[{}]"#, now()).unwrap();
         assert_eq!(rows[0].id, "");
-        assert_eq!(rows[0].cells, vec!["", "", "", "", ""]);
+        assert_eq!(rows[0].cells, vec!["", "", "", "", "", ""]); // an unlabeled issue leaves the column blank
         assert_eq!(rows[0].web_url, "");
     }
 
@@ -431,8 +670,11 @@ mod tests {
 
     #[test]
     fn parses_branches_and_commits() {
-        let b = parse(Tab::Branches, r#"[{"name":"dev","protected":false,"commit":{"short_id":"abc123"}}]"#, now()).unwrap();
-        assert_eq!(b[0].cells, vec!["dev", "", "abc123"]);
+        let json = r#"[{"name":"dev","protected":false,
+          "commit":{"short_id":"abc123","author_name":"Alice A"}}]"#;
+        let b = parse(Tab::Branches, json, now()).unwrap();
+        // the last committer stands in for "who owns this branch"
+        assert_eq!(b[0].cells, vec!["dev", "Alice A", "", "abc123"]);
         let c = parse(Tab::Commits, r#"[{"id":"fullsha0000","short_id":"fulls","title":"init","author_name":"al","created_at":"2026-07-30T11:30:00Z"}]"#, now()).unwrap();
         assert_eq!(c[0].id, "fullsha0000");
         assert_eq!(c[0].cells[0], "fulls");

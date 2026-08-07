@@ -28,6 +28,25 @@ pub struct ParsedDiff {
     pub files: usize,
 }
 
+impl ParsedDiff {
+    /// Each file in the diff as (path, the row its header sits on), in order.
+    /// Drives the file list beside the diff and the `[` / `]` jumps.
+    pub fn file_positions(&self) -> Vec<(&str, usize)> {
+        self.rows
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| r.kind == RowKind::FileHeader)
+            .map(|(i, r)| (r.left.as_str(), i))
+            .collect()
+    }
+
+    /// Index into `file_positions` of the file that `row` belongs to.
+    pub fn file_at(&self, row: usize) -> usize {
+        let files = self.file_positions();
+        files.iter().rposition(|(_, at)| *at <= row).unwrap_or(0)
+    }
+}
+
 fn ext_of(path: &str) -> String {
     Path::new(path)
         .extension()
@@ -157,6 +176,34 @@ pub fn parse(unified: &str) -> ParsedDiff {
     }
 
     ParsedDiff { rows, files }
+}
+
+#[cfg(test)]
+mod file_nav_tests {
+    use super::*;
+
+    fn two_files() -> ParsedDiff {
+        let mut d = String::new();
+        for f in ["src/a.rs", "src/b.rs"] {
+            d.push_str(&format!("diff --git a/{f} b/{f}\n@@ -1,2 +1,2 @@\n one\n two\n"));
+        }
+        parse(&d)
+    }
+
+    #[test]
+    fn file_positions_and_lookup() {
+        let d = two_files();
+        let files = d.file_positions();
+        assert_eq!(files.len(), 2);
+        assert_eq!(files[0].0, "src/a.rs");
+        assert_eq!(files[1].0, "src/b.rs");
+        // rows before the second header belong to the first file
+        assert_eq!(d.file_at(0), 0);
+        assert_eq!(d.file_at(files[1].1 - 1), 0);
+        // …and from its header on, to the second
+        assert_eq!(d.file_at(files[1].1), 1);
+        assert_eq!(d.file_at(d.rows.len() - 1), 1);
+    }
 }
 
 #[cfg(test)]
