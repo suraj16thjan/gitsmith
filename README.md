@@ -7,6 +7,17 @@ A fast terminal UI for **GitLab and GitHub**, built with [`ratatui`](https://git
 
 ## Installation
 
+### Quick install (macOS / Linux)
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/suraj16thjan/gitsmith/main/install.sh | bash
+```
+
+Downloads the prebuilt binary for your platform from the latest GitHub release
+and installs it to `~/.local/bin` (or `/usr/local/bin` when writable). Pin a
+version with `GITSMITH_VERSION=v0.2.2` or change the target with
+`GITSMITH_BIN_DIR=~/bin`. No Rust toolchain required.
+
 ### From crates.io
 
 ```bash
