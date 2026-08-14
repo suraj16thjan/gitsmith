@@ -10,7 +10,7 @@ pub struct GhBackend;
 fn to_row(tab: Tab, v: &Value, now: DateTime<Utc>) -> Row {
     let updated = relative_time_str(&s(v, "updated_at"), now);
     let cells = match tab {
-        Tab::Issues | Tab::MergeRequests => vec![
+        Tab::Issues => vec![
             num(v, "number"),
             s(v, "title"),
             join(v, "labels", Some("name")), // GitHub labels are objects
@@ -18,6 +18,19 @@ fn to_row(tab: Tab, v: &Value, now: DateTime<Utc>) -> Row {
             nested_str(v, "user", "login"),
             updated,
         ],
+        Tab::MergeRequests => {
+            let src = nested_str(v, "head", "ref");
+            let dst = nested_str(v, "base", "ref");
+            vec![
+                num(v, "number"),
+                s(v, "title"),
+                if src.is_empty() && dst.is_empty() { String::new() } else { format!("{src} → {dst}") },
+                join(v, "labels", Some("name")),
+                s(v, "state"),
+                nested_str(v, "user", "login"),
+                updated,
+            ]
+        }
         Tab::Pipelines => vec![num(v, "id"), s(v, "status"), s(v, "head_branch"), updated],
         Tab::Runners => vec![num(v, "id"), s(v, "name"), s(v, "status")],
         Tab::Releases => vec![
@@ -301,6 +314,50 @@ impl Backend for GhBackend {
         Ok(crate::backend::created_url(&out))
     }
 
+    fn create_pipeline(&self, _branch: &str) -> Result<String> {
+        // GitHub Actions runs are triggered by a workflow_dispatch (which needs a
+        // specific workflow), not by naming a branch — there's no "run this ref".
+        anyhow::bail!("GitHub Actions runs are triggered by workflow_dispatch, not created from a branch");
+    }
+
+    fn create_tag(&self, branch: &str, name: &str) -> Result<String> {
+        // An empty branch means the project's default branch.
+        let branch = if branch.is_empty() {
+            let out = crate::backend::run("gh", &["api", "repos/{owner}/{repo}"])?;
+            serde_json::from_str::<Value>(&out)
+                .ok()
+                .and_then(|v| v.get("default_branch").and_then(Value::as_str).map(str::to_string))
+                .filter(|s| !s.is_empty())
+                .context("could not determine the default branch")?
+        } else {
+            branch.to_string()
+        };
+        // A tag is a ref pointing at the branch's commit; look the SHA up first.
+        // Slashes in a branch name (`feature/x`) are path separators, so encode them.
+        let enc = branch.replace('/', "%2F");
+        let heads = format!("repos/{{owner}}/{{repo}}/branches/{enc}");
+        let out = crate::backend::run("gh", &["api", &heads])?;
+        let sha = serde_json::from_str::<Value>(&out)
+            .ok()
+            .and_then(|v| v.get("commit").and_then(|c| c.get("sha")).and_then(Value::as_str).map(str::to_string))
+            .filter(|s| !s.is_empty())
+            .context("could not read the branch's commit SHA")?;
+        let path = "repos/{owner}/{repo}/git/refs";
+        let args = owned(&[
+            "api",
+            "--method",
+            "POST",
+            path,
+            "-f",
+            &format!("ref=refs/tags/{name}"),
+            "-f",
+            &format!("sha={sha}"),
+        ]);
+        let argv: Vec<&str> = args.iter().map(String::as_str).collect();
+        crate::backend::run("gh", &argv)?;
+        Ok(name.to_string())
+    }
+
     fn commit_diff(&self, sha: &str) -> Result<String> {
         // The diff media type returns a ready-made unified diff.
         crate::backend::run(
@@ -436,11 +493,12 @@ mod tests {
           {"number":42,"title":"Add feature","state":"open",
            "labels":[{"name":"enhancement"},{"name":"p1"}],
            "user":{"login":"bob"},"updated_at":"2026-07-30T11:30:00Z",
+           "head":{"ref":"dev"},"base":{"ref":"main"},
            "html_url":"https://github.com/o/r/pull/42"}
         ]"#;
         let rows = parse(Tab::MergeRequests, json, now()).unwrap();
         assert_eq!(rows[0].id, "42");
-        assert_eq!(rows[0].cells, vec!["42", "Add feature", "enhancement, p1", "open", "bob", "30m ago"]);
+        assert_eq!(rows[0].cells, vec!["42", "Add feature", "dev → main", "enhancement, p1", "open", "bob", "30m ago"]);
         assert_eq!(rows[0].web_url, "https://github.com/o/r/pull/42");
         // raw JSON is retained for the detail view
         assert_eq!(rows[0].raw["title"], "Add feature");

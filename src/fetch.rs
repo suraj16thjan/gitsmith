@@ -9,13 +9,16 @@ pub enum Msg {
     Comments { result: Result<String, String> },
     Jobs { result: Result<String, String> },
     JobLog { result: Result<String, String> },
+    /// The trace stream ended (the job finished).
+    JobLogDone,
     JobActed { result: Result<(), String> },
     Repos { result: Result<Vec<String>, String> },
     /// Hosts the chosen CLI is configured for, and where that list came from.
     Hosts { kind: Kind, hosts: Vec<String>, origin: String },
-    /// A newly opened MR/PR or issue: the CLI's output (its URL) or the failure.
+    /// A newly opened MR/PR, issue, member, pipeline, or tag: the CLI's output
+    /// (its URL) or the failure.
     Created { result: Result<String, String> },
-    /// Branch names for the new-MR form.
+    /// Branch names for the new-MR/pipeline/tag form dropdowns.
     Branches { result: Result<Vec<String>, String> },
 }
 
@@ -93,6 +96,89 @@ pub fn spawn_job_log(backend: Arc<dyn Backend>, job_id: String, tx: Sender<Msg>)
     });
 }
 
+/// Stream a job's live trace: when the backend has a streaming command (GitLab's
+/// `glab ci trace`), read its stdout as it arrives and forward each chunk; when it
+/// doesn't (GitHub), fall back to the one-shot `job_log`. Either way a
+/// `JobLogDone` closes the stream.
+pub fn spawn_job_trace(backend: Arc<dyn Backend>, job_id: String, tx: Sender<Msg>) {
+    std::thread::spawn(move || {
+        let Some((prog, args)) = backend.trace_cmd(&job_id) else {
+            let result = backend.job_log(&job_id).map_err(|e| format!("{e:#}"));
+            let _ = tx.send(Msg::JobLog { result });
+            let _ = tx.send(Msg::JobLogDone);
+            return;
+        };
+        stream_trace(&prog, &args, &tx);
+    });
+}
+
+fn stream_trace(prog: &str, args: &[String], tx: &Sender<Msg>) {
+    use std::io::{BufRead, BufReader, Read};
+    use std::process::{Command, Stdio};
+    use std::time::Instant;
+
+    let cmd_id = crate::backend::record_cmd(format!("{prog} {}", args.join(" ")));
+    let mut cmd = Command::new(prog);
+    cmd.args(args).stdout(Stdio::piped()).stderr(Stdio::piped());
+    if let Some(host) = crate::backend::host_override() {
+        if prog == "glab" {
+            cmd.env("GITLAB_HOST", host);
+        } else if prog == "gh" {
+            cmd.env("GH_HOST", host);
+        }
+    }
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(_) => {
+            crate::backend::mark_cmd(cmd_id, false);
+            let _ = tx.send(Msg::JobLog {
+                result: Err(format!("failed to run `{prog}` — is it installed and on PATH?")),
+            });
+            let _ = tx.send(Msg::JobLogDone);
+            return;
+        }
+    };
+
+    // Accumulate the whole trace and re-send it in full (throttled), so the log
+    // parses as one document — ANSI colors and `\r` redraws stay faithful across
+    // lines instead of being reset per chunk.
+    let mut trace = String::new();
+    let mut last_send = Instant::now();
+    if let Some(stdout) = child.stdout.take() {
+        let mut reader = BufReader::new(stdout);
+        let mut line = String::new();
+        loop {
+            line.clear();
+            match reader.read_line(&mut line) {
+                Ok(0) => break, // EOF
+                Ok(_) => {
+                    trace.push_str(&line);
+                    if last_send.elapsed() >= std::time::Duration::from_millis(250) {
+                        let _ = tx.send(Msg::JobLog { result: Ok(trace.clone()) });
+                        last_send = Instant::now();
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    }
+
+    let status = child.wait();
+    let ok = matches!(status, Ok(s) if s.success());
+    crate::backend::mark_cmd(cmd_id, ok);
+    // A failed run with no output (bad job id, auth) surfaces its stderr as an error.
+    if trace.is_empty() && !ok
+        && let Some(mut stderr) = child.stderr.take()
+    {
+        let mut err = String::new();
+        let _ = stderr.read_to_string(&mut err);
+        let _ = tx.send(Msg::JobLog { result: Err(err.trim().to_string()) });
+    } else {
+        let _ = tx.send(Msg::JobLog { result: Ok(trace) });
+    }
+    let _ = tx.send(Msg::JobLogDone);
+}
+
 pub fn spawn_job_act(backend: Arc<dyn Backend>, action: JobAction, job_id: String, tx: Sender<Msg>) {
     std::thread::spawn(move || {
         let result = backend.job_act(action, &job_id).map_err(|e| format!("{e:#}"));
@@ -103,6 +189,20 @@ pub fn spawn_job_act(backend: Arc<dyn Backend>, action: JobAction, job_id: Strin
 pub fn spawn_create_mr(backend: Arc<dyn Backend>, mr: NewMr, tx: Sender<Msg>) {
     std::thread::spawn(move || {
         let result = backend.create_mr(&mr).map_err(|e| format!("{e:#}"));
+        let _ = tx.send(Msg::Created { result });
+    });
+}
+
+pub fn spawn_create_pipeline(backend: Arc<dyn Backend>, branch: String, tx: Sender<Msg>) {
+    std::thread::spawn(move || {
+        let result = backend.create_pipeline(&branch).map_err(|e| format!("{e:#}"));
+        let _ = tx.send(Msg::Created { result });
+    });
+}
+
+pub fn spawn_create_tag(backend: Arc<dyn Backend>, branch: String, name: String, tx: Sender<Msg>) {
+    std::thread::spawn(move || {
+        let result = backend.create_tag(&branch, &name).map_err(|e| format!("{e:#}"));
         let _ = tx.send(Msg::Created { result });
     });
 }

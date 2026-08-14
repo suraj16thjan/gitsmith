@@ -53,7 +53,8 @@ impl Tab {
     /// titles to nothing next to a 3-char id).
     pub fn weights(&self) -> &'static [u16] {
         match self {
-            Tab::Issues | Tab::MergeRequests => &[5, 34, 18, 10, 13, 12],
+            Tab::Issues => &[5, 34, 18, 10, 13, 12],
+            Tab::MergeRequests => &[4, 23, 15, 15, 9, 10, 12],
             Tab::Pipelines => &[6, 14, 40, 14],
             Tab::Runners => &[8, 50, 14],
             Tab::Releases => &[20, 40, 16],
@@ -69,7 +70,7 @@ impl Tab {
     pub fn headers(&self) -> &'static [&'static str] {
         match self {
             Tab::Issues => &["#", "Title", "Labels", "State", "Author", "Updated"],
-            Tab::MergeRequests => &["#", "Title", "Labels", "State", "Author", "Updated"],
+            Tab::MergeRequests => &["#", "Title", "Branch", "Labels", "State", "Author", "Updated"],
             Tab::Pipelines => &["#", "Status", "Ref", "Updated"],
             Tab::Runners => &["ID", "Description", "Status"],
             Tab::Releases => &["Tag", "Name", "Published"],
@@ -409,9 +410,15 @@ pub trait Backend: Send + Sync {
         anyhow::bail!("jobs not supported by this backend")
     }
 
-    /// Raw log text for a job.
+    /// Raw log text for a job (a single full fetch — the non-streaming fallback).
     fn job_log(&self, _job_id: &str) -> anyhow::Result<String> {
         anyhow::bail!("logs not supported by this backend")
+    }
+
+    /// The command (program + argv) that streams a job's live trace to stdout,
+    /// or `None` when the backend can't stream (use `job_log` polling instead).
+    fn trace_cmd(&self, _job_id: &str) -> Option<(String, Vec<String>)> {
+        None
     }
 
     /// Retry or cancel a single job.
@@ -438,6 +445,16 @@ pub trait Backend: Send + Sync {
     /// Open an issue; returns the CLI's output, which is the new issue's URL.
     fn create_issue(&self, _title: &str, _description: &str) -> anyhow::Result<String> {
         anyhow::bail!("creating issues is not supported by this backend")
+    }
+
+    /// Start a CI pipeline on `branch`; returns the CLI's output (the pipeline URL).
+    fn create_pipeline(&self, _branch: &str) -> anyhow::Result<String> {
+        anyhow::bail!("creating pipelines is not supported by this backend")
+    }
+
+    /// Tag `branch` with `name`; returns the CLI's output (the tag URL or name).
+    fn create_tag(&self, _branch: &str, _name: &str) -> anyhow::Result<String> {
+        anyhow::bail!("creating tags is not supported by this backend")
     }
 }
 
@@ -735,7 +752,7 @@ fn cmd_log() -> &'static Mutex<VecDeque<CmdEntry>> {
     LOG.get_or_init(|| Mutex::new(VecDeque::new()))
 }
 
-fn record_cmd(line: String) -> u64 {
+pub(crate) fn record_cmd(line: String) -> u64 {
     static NEXT: AtomicU64 = AtomicU64::new(0);
     let id = NEXT.fetch_add(1, Ordering::Relaxed);
     let mut log = cmd_log().lock().unwrap_or_else(|e| e.into_inner());
@@ -746,7 +763,7 @@ fn record_cmd(line: String) -> u64 {
     id
 }
 
-fn mark_cmd(id: u64, ok: bool) {
+pub(crate) fn mark_cmd(id: u64, ok: bool) {
     let mut log = cmd_log().lock().unwrap_or_else(|e| e.into_inner());
     if let Some(e) = log.iter_mut().find(|e| e.id == id) {
         e.ok = Some(ok);
@@ -1188,7 +1205,7 @@ github.com
         assert_eq!(Tab::Commits.headers().len(), 4);
         assert_eq!(Tab::Issues.title(), "Issues");
         assert_eq!(Tab::Issues.headers().len(), 6);
-        assert_eq!(Tab::MergeRequests.headers().len(), 6);
+        assert_eq!(Tab::MergeRequests.headers().len(), 7);
         assert_eq!(Tab::Pipelines.headers().len(), 4);
         assert_eq!(Tab::Runners.headers().len(), 3);
         assert_eq!(Tab::Releases.headers().len(), 3);

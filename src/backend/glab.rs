@@ -10,7 +10,7 @@ pub struct GlabBackend;
 fn to_row(tab: Tab, v: &Value, now: DateTime<Utc>) -> Row {
     let updated = relative_time_str(&s(v, "updated_at"), now);
     let cells = match tab {
-        Tab::Issues | Tab::MergeRequests => vec![
+        Tab::Issues => vec![
             num(v, "iid"),
             s(v, "title"),
             join(v, "labels", None), // GitLab labels are plain strings
@@ -18,6 +18,19 @@ fn to_row(tab: Tab, v: &Value, now: DateTime<Utc>) -> Row {
             nested_str(v, "author", "username"),
             updated,
         ],
+        Tab::MergeRequests => {
+            let src = s(v, "source_branch");
+            let dst = s(v, "target_branch");
+            vec![
+                num(v, "iid"),
+                s(v, "title"),
+                if src.is_empty() && dst.is_empty() { String::new() } else { format!("{src} → {dst}") },
+                join(v, "labels", None),
+                s(v, "state"),
+                nested_str(v, "author", "username"),
+                updated,
+            ]
+        }
         Tab::Pipelines => vec![num(v, "id"), s(v, "status"), s(v, "ref"), updated],
         Tab::Runners => vec![num(v, "id"), s(v, "description"), s(v, "status")],
         Tab::Releases => vec![
@@ -383,6 +396,17 @@ impl Backend for GlabBackend {
         crate::backend::run("glab", &["api", &glab_job_trace_path(&enc, job_id)])
     }
 
+    /// `glab ci trace` streams a job's log in real time (polls log chunks), so it
+    /// tails a running job where a single `/trace` snapshot can lag behind.
+    fn trace_cmd(&self, job_id: &str) -> Option<(String, Vec<String>)> {
+        let mut args = vec!["ci".into(), "trace".into(), job_id.into()];
+        if let Some(repo) = crate::backend::repo_override() {
+            args.push("-R".into());
+            args.push(repo);
+        }
+        Some(("glab".into(), args))
+    }
+
     fn job_act(&self, action: crate::backend::JobAction, job_id: &str) -> Result<()> {
         let enc = encode_project(&current_project()?);
         let path = glab_job_act_path(&enc, job_id, action);
@@ -439,6 +463,33 @@ impl Backend for GlabBackend {
 
     fn create_issue(&self, title: &str, description: &str) -> Result<String> {
         let args = glab_issue_api_args(&current_project()?, title, description);
+        let argv: Vec<&str> = args.iter().map(String::as_str).collect();
+        Ok(crate::backend::created_url(&glab_run(&argv)?))
+    }
+
+    fn create_pipeline(&self, branch: &str) -> Result<String> {
+        let project = current_project()?;
+        let branch = if branch.is_empty() { default_branch(&project)? } else { branch.to_string() };
+        let path = format!("projects/{}/pipeline", encode_project(&project));
+        let args = owned(&["api", "--method", "POST", &path, "-f", &format!("ref={branch}")]);
+        let argv: Vec<&str> = args.iter().map(String::as_str).collect();
+        Ok(crate::backend::created_url(&glab_run(&argv)?))
+    }
+
+    fn create_tag(&self, branch: &str, name: &str) -> Result<String> {
+        let project = current_project()?;
+        let branch = if branch.is_empty() { default_branch(&project)? } else { branch.to_string() };
+        let path = format!("projects/{}/repository/tags", encode_project(&project));
+        let args = owned(&[
+            "api",
+            "--method",
+            "POST",
+            &path,
+            "-f",
+            &format!("tag_name={name}"),
+            "-f",
+            &format!("ref={branch}"),
+        ]);
         let argv: Vec<&str> = args.iter().map(String::as_str).collect();
         Ok(crate::backend::created_url(&glab_run(&argv)?))
     }
@@ -503,6 +554,19 @@ mod tests {
         assert_eq!(rows[0].web_url, "https://gitlab.com/o/r/-/issues/7");
         // raw JSON is retained for the detail view
         assert_eq!(rows[0].raw["title"], "Bug in parser");
+    }
+
+    #[test]
+    fn parses_merge_requests_with_branch() {
+        let json = r#"[
+          {"iid":12,"title":"Wire up parser","state":"opened","labels":[],
+           "source_branch":"dev","target_branch":"main",
+           "author":{"username":"bob"},"updated_at":"2026-07-30T10:00:00Z",
+           "web_url":"https://gitlab.com/o/r/-/merge_requests/12"}
+        ]"#;
+        let rows = parse(Tab::MergeRequests, json, now()).unwrap();
+        assert_eq!(rows[0].id, "12");
+        assert_eq!(rows[0].cells, vec!["12", "Wire up parser", "dev → main", "", "opened", "bob", "2h ago"]);
     }
 
     #[test]

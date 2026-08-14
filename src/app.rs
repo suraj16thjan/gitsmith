@@ -58,8 +58,6 @@ pub struct LogView {
     pub follow: bool,
     pub loading: bool,
     pub error: Option<String>,
-    /// Consecutive polls with no new lines — used to stop tailing a finished job.
-    pub stable_polls: u8,
     pub last_fetch: std::time::Instant,
     /// Last rendered content height, so leaving follow mode starts from the
     /// bottom-of-viewport line rather than jumping.
@@ -108,11 +106,13 @@ pub enum NewKind {
     Mr,
     Issue,
     Member,
+    Pipeline,
+    Tag,
 }
 
 /// The `n` form: one text field per label, some with a type-to-filter dropdown
-/// (branches for an MR, roles for a member). Blank MR branch fields defer to the
-/// CLI/API — the branch you're on, and the project's default branch.
+/// (branches for an MR/pipeline/tag, roles for a member). Blank branch fields
+/// defer to the CLI/API — the branch you're on, or the project's default branch.
 pub struct NewItemForm {
     pub kind: NewKind,
     /// One value per entry in `fields()`.
@@ -132,12 +132,16 @@ impl NewItemForm {
     const MR_FIELDS: [&'static str; 4] = ["Source branch", "Target branch", "Title", "Description"];
     const ISSUE_FIELDS: [&'static str; 2] = ["Title", "Description"];
     const MEMBER_FIELDS: [&'static str; 2] = ["Username", "Role"];
+    const PIPELINE_FIELDS: [&'static str; 1] = ["Branch"];
+    const TAG_FIELDS: [&'static str; 2] = ["Tag name", "Branch"];
 
     pub fn fields(&self) -> &'static [&'static str] {
         match self.kind {
             NewKind::Mr => &Self::MR_FIELDS,
             NewKind::Issue => &Self::ISSUE_FIELDS,
             NewKind::Member => &Self::MEMBER_FIELDS,
+            NewKind::Pipeline => &Self::PIPELINE_FIELDS,
+            NewKind::Tag => &Self::TAG_FIELDS,
         }
     }
 
@@ -153,6 +157,8 @@ impl NewItemForm {
     pub fn on_option_field(&self) -> bool {
         match self.kind {
             NewKind::Mr => self.field <= 1,
+            NewKind::Pipeline => self.field == 0,
+            NewKind::Tag => self.field == 1,
             NewKind::Member => self.field == 1,
             NewKind::Issue => false,
         }
@@ -171,12 +177,15 @@ impl NewItemForm {
             .collect()
     }
 
-    /// The field that must not be empty, and what to call it when it is.
-    fn required(&self) -> (usize, &'static str) {
+    /// The field that must not be empty, and what to call it when it is. A pipeline
+    /// needs nothing: an empty branch means the project's default branch.
+    fn required(&self) -> Option<(usize, &'static str)> {
         match self.kind {
-            NewKind::Mr => (2, "a title is required"),
-            NewKind::Issue => (0, "a title is required"),
-            NewKind::Member => (0, "a username is required"),
+            NewKind::Pipeline => None,
+            NewKind::Mr => Some((2, "a title is required")),
+            NewKind::Issue => Some((0, "a title is required")),
+            NewKind::Member => Some((0, "a username is required")),
+            NewKind::Tag => Some((0, "a tag name is required")),
         }
     }
 }
@@ -316,8 +325,10 @@ impl App {
             Tab::MergeRequests => NewKind::Mr,
             Tab::Issues => NewKind::Issue,
             Tab::Members => NewKind::Member,
+            Tab::Pipelines => NewKind::Pipeline,
+            Tab::Tags => NewKind::Tag,
             _ => {
-                self.flash = Some("n: new MR/PR, issue, or member — on those tabs".into());
+                self.flash = Some("n: new MR/PR, issue, member, pipeline, or tag — on those tabs".into());
                 return;
             }
         };
@@ -336,6 +347,9 @@ impl App {
                 let roles = crate::backend::member_roles(self.kind);
                 (vec![String::new(), String::new()], 0, roles.iter().map(|r| (*r).to_string()).collect(), false)
             }
+            // An empty branch means the project's default branch.
+            NewKind::Pipeline => (vec![String::new()], 0, Vec::new(), true),
+            NewKind::Tag => (vec![String::new(), String::new()], 0, Vec::new(), true),
         };
         self.new_item = Some(NewItemForm {
             kind,
@@ -354,8 +368,9 @@ impl App {
 
     fn submit_new_item(&mut self) {
         let Some(form) = self.new_item.as_mut() else { return };
-        let (required, message) = form.required();
-        if form.value(required).trim().is_empty() {
+        if let Some((required, message)) = form.required()
+            && form.value(required).trim().is_empty()
+        {
             form.error = Some(message.into());
             form.field = required;
             return;
@@ -387,6 +402,12 @@ impl App {
                     values[1].clone()
                 };
                 fetch::spawn_add_member(self.backend.clone(), values[0].clone(), role, self.tx.clone());
+            }
+            NewKind::Pipeline => {
+                fetch::spawn_create_pipeline(self.backend.clone(), values[0].clone(), self.tx.clone());
+            }
+            NewKind::Tag => {
+                fetch::spawn_create_tag(self.backend.clone(), values[1].clone(), values[0].clone(), self.tx.clone());
             }
         }
     }
@@ -883,14 +904,7 @@ impl App {
                     match result {
                         Ok(text) => {
                             lv.error = None;
-                            let rows = crate::ansi::parse(&text);
-                            // track "no new lines" to stop tailing a finished job
-                            if rows.len() == lv.rows.len() {
-                                lv.stable_polls = lv.stable_polls.saturating_add(1);
-                            } else {
-                                lv.stable_polls = 0;
-                            }
-                            lv.rows = rows;
+                            lv.rows = crate::ansi::parse(&text);
                             // In follow mode the renderer pins to the bottom; only the
                             // first (non-follow was never set) load needs scroll reset.
                             if !lv.follow {
@@ -899,6 +913,11 @@ impl App {
                         }
                         Err(e) => lv.error = Some(e),
                     }
+                }
+            }
+            Msg::JobLogDone => {
+                if let Some(lv) = self.log_view.as_mut() {
+                    lv.loading = false;
                 }
             }
             Msg::JobActed { result } => match result {
@@ -934,6 +953,8 @@ impl App {
                     let created_tab = match kind {
                         Some(NewKind::Issue) => Tab::Issues,
                         Some(NewKind::Member) => Tab::Members,
+                        Some(NewKind::Pipeline) => Tab::Pipelines,
+                        Some(NewKind::Tag) => Tab::Tags,
                         _ => Tab::MergeRequests,
                     };
                     if Tab::ALL[self.active] == created_tab {
@@ -1385,11 +1406,10 @@ impl App {
             follow: true,
             loading: true,
             error: None,
-            stable_polls: 0,
             last_fetch: std::time::Instant::now(),
             viewport_h: 0,
         });
-        fetch::spawn_job_log(self.backend.clone(), job_id, self.tx.clone());
+        fetch::spawn_job_trace(self.backend.clone(), job_id, self.tx.clone());
     }
 
     /// Live-refresh open overlays: the job log tails, and the jobs list re-polls so
@@ -1400,11 +1420,15 @@ impl App {
     }
 
     fn tick_log(&mut self) {
+        // GitLab streams its trace (`glab ci trace`) so there's nothing to poll;
+        // only GitHub's one-shot log needs re-fetching while the run is live.
+        if self.kind != Kind::Gh {
+            return;
+        }
         let due = self.log_view.as_ref().is_some_and(|lv| {
             lv.follow
                 && lv.error.is_none()
                 && !lv.loading
-                && lv.stable_polls < 4
                 && lv.last_fetch.elapsed() >= std::time::Duration::from_millis(1500)
         });
         if due {
@@ -1492,7 +1516,6 @@ impl App {
             KeyCode::Esc | KeyCode::Char('q') => self.log_view = None,
             KeyCode::Char('G') => {
                 lv.follow = true;
-                lv.stable_polls = 0;
             }
             KeyCode::Char('j') | KeyCode::Down => {
                 lv.follow = false;
@@ -1957,10 +1980,37 @@ mod tests {
         a.handle_key(KeyEvent::from(KeyCode::Esc));
 
         // anywhere else: nothing to create
-        a.active = 2; // Pipelines
+        a.active = 6; // Branches
         a.handle_key(KeyEvent::from(KeyCode::Char('n')));
         assert!(a.new_item.is_none());
-        assert_eq!(a.flash.as_deref(), Some("n: new MR/PR, issue, or member — on those tabs"));
+        assert_eq!(a.flash.as_deref(), Some("n: new MR/PR, issue, member, pipeline, or tag — on those tabs"));
+    }
+
+    #[test]
+    fn n_on_pipelines_opens_a_pipeline_form() {
+        let mut a = app();
+        a.active = Tab::ALL.iter().position(|t| *t == Tab::Pipelines).unwrap();
+        a.handle_key(KeyEvent::from(KeyCode::Char('n')));
+        let form = a.new_item.as_ref().expect("form opens on Pipelines");
+        assert_eq!(form.kind, NewKind::Pipeline);
+        assert_eq!(form.fields(), ["Branch"]);
+        assert!(form.options_loading, "branches load for the dropdown");
+        // nothing is required: an empty branch means the default branch
+        a.handle_key(KeyEvent::from(KeyCode::Enter));
+        assert!(a.new_item.as_ref().unwrap().submitting, "an empty branch submits");
+    }
+
+    #[test]
+    fn n_on_tags_opens_a_tag_form() {
+        let mut a = app();
+        a.active = Tab::ALL.iter().position(|t| *t == Tab::Tags).unwrap();
+        a.handle_key(KeyEvent::from(KeyCode::Char('n')));
+        let form = a.new_item.as_ref().expect("form opens on Tags");
+        assert_eq!(form.kind, NewKind::Tag);
+        assert_eq!(form.fields(), ["Tag name", "Branch"]);
+        // a tag name is required
+        a.handle_key(KeyEvent::from(KeyCode::Enter));
+        assert_eq!(a.new_item.as_ref().unwrap().error.as_deref(), Some("a tag name is required"));
     }
 
     #[test]
@@ -2458,7 +2508,6 @@ mod tests {
             follow: false,
             loading: true,
             error: None,
-            stable_polls: 0,
             last_fetch: std::time::Instant::now(),
             viewport_h: 0,
         }
@@ -2484,6 +2533,20 @@ mod tests {
         assert!(!lv.loading);
         assert_eq!(lv.scroll, 0);
         assert!(!lv.rows.is_empty());
+    }
+
+    #[test]
+    fn apply_joblog_replaces_rows_and_done_clears_loading() {
+        let mut a = app();
+        a.log_view = Some(log_view());
+        // the stream re-sends the whole trace each poll — later sends replace, not append
+        a.apply(Msg::JobLog { result: Ok("line one\n".into()) });
+        a.apply(Msg::JobLog { result: Ok("line one\nline two\n".into()) });
+        assert_eq!(a.log_view.as_ref().unwrap().rows.len(), 2);
+        a.apply(Msg::JobLogDone);
+        assert!(!a.log_view.as_ref().unwrap().loading);
+        a.log_view = None;
+        a.apply(Msg::JobLogDone); // no panic without a view
     }
 
     #[test]

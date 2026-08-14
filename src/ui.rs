@@ -217,10 +217,14 @@ fn context_keys(app: &App) -> Vec<(&'static str, &'static str)> {
             keys.push(("C", "comment"));
         }
         Tab::Pipelines => {
+            keys.push(("n", "new pipeline"));
             keys.push(("r/d", "retry/cancel"));
         }
         Tab::Members => {
             keys.push(("n", "add member"));
+        }
+        Tab::Tags => {
+            keys.push(("n", "new tag"));
         }
         _ => {}
     }
@@ -416,13 +420,15 @@ pub fn render(f: &mut Frame, app: &mut App) {
     }
 }
 
-/// The `n` form: new MR/PR (with branch dropdowns) or new issue.
+/// The `n` form: new MR/PR (with branch dropdowns), issue, member, pipeline, or tag.
 fn render_new_item(f: &mut Frame, area: Rect, app: &App) {
     let Some(form) = app.new_item.as_ref() else { return };
     let th = theme();
     let noun = match form.kind {
         NewKind::Issue => "Issue".to_string(),
         NewKind::Member => "Member".to_string(),
+        NewKind::Pipeline => "Pipeline".to_string(),
+        NewKind::Tag => "Tag".to_string(),
         NewKind::Mr => (if app.is_gitlab() { "MR" } else { "PR" }).to_string(),
     };
     let matches = form.matches();
@@ -457,8 +463,8 @@ fn render_new_item(f: &mut Frame, area: Rect, app: &App) {
         // Empty fields say what will happen instead of looking unfinished.
         let placeholder = match (form.kind, i) {
             (NewKind::Mr, 0) => "(current branch)",
-            (NewKind::Mr, 1) => "(default branch)",
-            (NewKind::Mr, 2) | (NewKind::Issue, 0) | (NewKind::Member, 0) => "(required)",
+            (NewKind::Mr, 1) | (NewKind::Pipeline, 0) | (NewKind::Tag, 1) => "(default branch)",
+            (NewKind::Mr, 2) | (NewKind::Issue, 0) | (NewKind::Member, 0) | (NewKind::Tag, 0) => "(required)",
             (NewKind::Member, 1) => "(lowest role)",
             _ => "(none)",
         };
@@ -1225,7 +1231,7 @@ fn render_help(f: &mut Frame, area: Rect, app: &App) {
         (
             "Changing things",
             &[
-                ("n", "new MR/PR, issue, or member — on those tabs"),
+                ("n", "new MR/PR, issue, member, pipeline, or tag — on those tabs"),
                 ("a  M  c", "approve · merge · close (MRs/PRs)"),
                 ("c  O  C", "close · reopen · comment (Issues)"),
                 ("r  d", "retry · cancel (Pipelines, and jobs inside one)"),
@@ -1747,7 +1753,6 @@ mod tests {
             follow: false,
             loading: false,
             error: None,
-            stable_polls: 0,
             last_fetch: std::time::Instant::now(),
             viewport_h: 0,
         });

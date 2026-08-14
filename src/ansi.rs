@@ -42,7 +42,10 @@ pub fn parse(text: &str) -> Vec<Vec<(Color, String)>> {
             continue;
         }
         if b == b'\r' {
-            i += 1; // drop bare CR
+            // A carriage return rewrites the current line (progress bars, `\r`
+            // redraws); keep only the last segment instead of concatenating them.
+            buf.clear();
+            i += 1;
             continue;
         }
         buf.push(b);
@@ -148,5 +151,12 @@ mod tests {
         let rows = parse("a\n\nb");
         assert_eq!(rows.len(), 3);
         assert_eq!(rows[1], vec![(Color::Reset, String::new())]);
+    }
+
+    #[test]
+    fn carriage_return_keeps_last_segment() {
+        let rows = parse("progress 0%\rprogress 100%\n");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0][0], (Color::Reset, "progress 100%".to_string()));
     }
 }

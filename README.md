@@ -50,13 +50,14 @@ cargo run --release
 
 - **11 tabs** — Issues, MRs/PRs, Pipelines, Runners, Releases, Tags, Branches, Commits, Todos, Milestones, Members
 - **Every state listed** — issues and MRs come back open *and* closed, so a closed issue can be reopened; open items sort above settled ones, and protected branches above the rest
-- **Labels** — shown as their own column on Issues and MRs/PRs (blank when an item has none), and matched by the filter
+- **Labels and branches** — labels as their own column on Issues and MRs/PRs, and each MR/PR shows its `source → target` branch (both matched by the filter)
 - **Detail view** (`Enter`) — metadata, description, and the comment thread for issues/MRs
 - **Side-by-side diffs** — syntax-highlighted (syntect), with line numbers, a **sticky file header**, and a file list beside the diff that follows your scroll (`[` / `]` jump between files); `v` on an MR, or `Enter` on a commit
 - **Pipeline drill-down** — `Enter` a pipeline → its jobs; `Enter` a job → its **live-tailing ANSI log**, with severity coloring for plain output (ERROR/WARN/INFO, dim timestamps, `$` script lines) and the CI's own colors passed through untouched (follows the latest output like GitLab's trace). Parent/bridge jobs drill into downstream pipelines.
 - **Members and their roles** — who has access, sorted strongest first (GitLab access levels, GitHub permissions), including group-inherited access on GitLab
 - **Add a member** (`n` on the Members tab) — username plus a role picked from the host's own ladder (Guest…Owner, or read…admin); leaving the role blank grants the weakest one
 - **Create MRs/PRs and issues** (`n`) — a new MR/PR on the MRs/PRs tab, a new issue on Issues, with a type-to-filter dropdown of the repo's branches. Works with or without a local checkout: an empty Source uses the branch you're on, an empty Target uses the project's default branch
+- **Create pipelines and tags** (`n`) — a new CI pipeline on the Pipelines tab, or a new tag on the Tags tab; each is a small form with a type-to-filter dropdown of the repo's branches, and an empty branch means the project's default branch
 - **Paged lists** — every tab pulls 100 rows a page and keeps fetching in the background (up to 500) while you read, instead of stopping at the API's 20–30 row default
 - **Actions** — approve / merge / close MRs, close/reopen/comment on issues, retry/cancel pipelines and individual jobs — all behind a `[y/n]` confirm
 - **Works outside a git repo** — start anywhere and gitsmith asks for a host (`1` GitLab / `2` GitHub), lists your repos, and drops you into the normal workflow
@@ -79,7 +80,7 @@ The header's right side always lists the keys that do something in the view you'
 - `Ctrl-d` / `Ctrl-u` — half a screen down / up
 - `Enter` — open detail (or jobs on Pipelines, diff on Commits)
 - `v` — diff (MRs)
-- `n` — new MR/PR (MRs/PRs), new issue (Issues), add member (Members)
+- `n` — new MR/PR (MRs/PRs), new issue (Issues), add member (Members), new pipeline (Pipelines), new tag (Tags)
 - `f` or `/` — filter the current tab (each tab keeps its own query; `Esc` clears it)
 - `o` — open in browser
 - `P` — switch repo (fuzzy)
