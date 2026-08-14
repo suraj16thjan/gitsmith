@@ -1,6 +1,6 @@
 [package]
 name = "gitsmith"
-version = "1.0.0"
+version = "1.0.1"
 edition = "2024"
 description = "A fast terminal UI for GitLab and GitHub, wrapping the glab and gh CLIs (Rust + ratatui)"
 license = "MIT"

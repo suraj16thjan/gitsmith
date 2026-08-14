@@ -569,6 +569,7 @@ mod tests {
     fn parses_repo_list() {
         let json = r#"[{"nameWithOwner":"octo/hello"},{"nameWithOwner":"octo/world"}]"#;
         assert_eq!(parse_repos_gh(json), vec!["octo/hello", "octo/world"]);
+        assert!(parse_repos_gh("not json").is_empty());
     }
 
     #[test]
