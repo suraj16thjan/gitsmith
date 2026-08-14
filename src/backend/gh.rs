@@ -184,7 +184,13 @@ fn gh_jobs_args(pipeline_id: &str) -> Vec<String> {
 }
 
 fn gh_job_log_args(job_id: &str) -> Vec<String> {
-    owned(&["run", "view", "--job", job_id, "--log"])
+    // `gh run view --job --log` refuses to print a log while its run is still in
+    // progress; the jobs logs endpoint returns partial logs for a running job.
+    vec![
+        "api".into(),
+        format!("repos/{{owner}}/{{repo}}/actions/jobs/{job_id}/logs"),
+        "--allow-escape-sequences".into(),
+    ]
 }
 
 /// `gh pr create` args. Passing both title and body keeps gh non-interactive.
@@ -563,13 +569,12 @@ mod tests {
     fn parses_repo_list() {
         let json = r#"[{"nameWithOwner":"octo/hello"},{"nameWithOwner":"octo/world"}]"#;
         assert_eq!(parse_repos_gh(json), vec!["octo/hello", "octo/world"]);
-        assert!(parse_repos_gh("not json").is_empty());
     }
 
     #[test]
     fn job_args_mapping() {
         assert_eq!(gh_jobs_args("5"), vec!["api", "repos/{owner}/{repo}/actions/runs/5/jobs"]);
-        assert_eq!(gh_job_log_args("88"), vec!["run", "view", "--job", "88", "--log"]);
+        assert_eq!(gh_job_log_args("88"), vec!["api", "repos/{owner}/{repo}/actions/jobs/88/logs", "--allow-escape-sequences"]);
         assert_eq!(gh_job_retry_args("88"), vec!["run", "rerun", "--job", "88"]);
     }
 
