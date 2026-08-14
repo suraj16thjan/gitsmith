@@ -543,7 +543,7 @@ dependencies = [
 
 [[package]]
 name = "gitsmith"
-version = "0.2.2"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "chrono",
