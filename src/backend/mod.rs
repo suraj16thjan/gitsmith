@@ -185,6 +185,7 @@ pub struct NewMr {
 pub enum JobAction {
     Retry,
     Cancel,
+    Play,
 }
 
 impl JobAction {
@@ -192,6 +193,7 @@ impl JobAction {
         match self {
             JobAction::Retry => format!("Retry job #{id}?"),
             JobAction::Cancel => format!("Cancel job #{id}?"),
+            JobAction::Play => format!("Run manual job #{id}?"),
         }
     }
 }
@@ -447,8 +449,8 @@ pub trait Backend: Send + Sync {
         anyhow::bail!("creating issues is not supported by this backend")
     }
 
-    /// Start a CI pipeline on `branch`; returns the CLI's output (the pipeline URL).
-    fn create_pipeline(&self, _branch: &str) -> anyhow::Result<String> {
+    /// Start a CI pipeline on `ref_name` (branch or tag); returns the CLI's output (the pipeline URL).
+    fn create_pipeline(&self, _ref_name: &str) -> anyhow::Result<String> {
         anyhow::bail!("creating pipelines is not supported by this backend")
     }
 
@@ -646,10 +648,68 @@ pub enum Kind {
 
 pub fn backend_kind(remote_url: &str) -> Kind {
     if remote_url.contains("gitlab") {
-        Kind::Glab
-    } else {
-        Kind::Gh
+        return Kind::Glab;
     }
+    if remote_url.contains("github") {
+        return Kind::Gh;
+    }
+    // SCP-style alias like `myalias:group/repo` — resolve the SSH host alias.
+    if let Some((alias, _)) = remote_url.trim().split_once(':') {
+        if !alias.contains('/') && !alias.contains('@') {
+            if let Some(real) = resolve_ssh_alias(alias) {
+                if real.contains("gitlab") {
+                    return Kind::Glab;
+                }
+                if real.contains("github") {
+                    return Kind::Gh;
+                }
+            }
+        }
+        // Also try `git@alias:group/repo` — strip the user part.
+        if let Some((_, host)) = alias.split_once('@') {
+            if let Some(real) = resolve_ssh_alias(host) {
+                if real.contains("gitlab") {
+                    return Kind::Glab;
+                }
+                if real.contains("github") {
+                    return Kind::Gh;
+                }
+            }
+        }
+    }
+    Kind::Gh
+}
+
+/// Resolve an SSH host alias to its real `HostName` from `~/.ssh/config`.
+fn resolve_ssh_alias(alias: &str) -> Option<String> {
+    let home = std::env::var("HOME").ok()?;
+    let path = PathBuf::from(home).join(".ssh").join("config");
+    let text = std::fs::read_to_string(path).ok()?;
+    resolve_ssh_alias_in(alias, &text)
+}
+
+fn resolve_ssh_alias_in(alias: &str, text: &str) -> Option<String> {
+    let mut in_matching_host = false;
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        let indent = line.len() - line.trim_start().len();
+        if let Some(rest) = trimmed.strip_prefix("Host ").or_else(|| trimmed.strip_prefix("Host\t")) {
+            in_matching_host = rest.split_whitespace().any(|pat| pat == alias);
+            continue;
+        }
+        if indent == 0 {
+            in_matching_host = false;
+        }
+        if in_matching_host {
+            if let Some(rest) = trimmed.strip_prefix("HostName ").or_else(|| trimmed.strip_prefix("HostName\t")) {
+                return Some(rest.trim().to_lowercase());
+            }
+        }
+    }
+    None
 }
 
 /// Decide which backend to use from env overrides and an optional git remote URL.
@@ -1221,6 +1281,19 @@ github.com
         assert!(matches!(backend_kind("https://gitlab.example.com/o/r"), Kind::Glab));
         assert!(matches!(backend_kind("git@github.com:o/r.git"), Kind::Gh));
         assert!(matches!(backend_kind("https://github.com/o/r.git"), Kind::Gh));
+    }
+
+    #[test]
+    fn ssh_alias_resolved_from_config() {
+        let cfg = "Host mygl\n  HostName gitlab.corp.example\n  User git\n\n\
+                   Host mygh\n  HostName github.com\n  User git\n\n\
+                   Host multi one two\n  HostName gitlab.multi.io\n";
+        assert_eq!(resolve_ssh_alias_in("mygl", cfg), Some("gitlab.corp.example".into()));
+        assert_eq!(resolve_ssh_alias_in("mygh", cfg), Some("github.com".into()));
+        assert_eq!(resolve_ssh_alias_in("one", cfg), Some("gitlab.multi.io".into()));
+        assert_eq!(resolve_ssh_alias_in("two", cfg), Some("gitlab.multi.io".into()));
+        assert_eq!(resolve_ssh_alias_in("unknown", cfg), None);
+        assert_eq!(resolve_ssh_alias_in("mygl", ""), None);
     }
 
     #[test]

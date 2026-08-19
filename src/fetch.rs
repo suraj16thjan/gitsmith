@@ -20,6 +20,8 @@ pub enum Msg {
     Created { result: Result<String, String> },
     /// Branch names for the new-MR/pipeline/tag form dropdowns.
     Branches { result: Result<Vec<String>, String> },
+    /// Tag names for the pipeline form dropdown (merged into options alongside branches).
+    Tags { result: Result<Vec<String>, String> },
 }
 
 pub fn spawn(backend: Arc<dyn Backend>, tab: Tab, page: u32, tx: Sender<Msg>) {
@@ -37,6 +39,16 @@ pub fn spawn_branches(backend: Arc<dyn Backend>, tx: Sender<Msg>) {
             .map(|rows| rows.into_iter().map(|r| r.id).filter(|b| !b.is_empty()).collect())
             .map_err(|e| format!("{e:#}"));
         let _ = tx.send(Msg::Branches { result });
+    });
+}
+
+pub fn spawn_tags(backend: Arc<dyn Backend>, tx: Sender<Msg>) {
+    std::thread::spawn(move || {
+        let result = backend
+            .list(Tab::Tags, 1)
+            .map(|rows| rows.into_iter().map(|r| r.id).filter(|t| !t.is_empty()).collect())
+            .map_err(|e| format!("{e:#}"));
+        let _ = tx.send(Msg::Tags { result });
     });
 }
 

@@ -278,6 +278,7 @@ impl Backend for GhBackend {
             }
             // GitHub Actions has no single-job cancel — only whole-run.
             Cancel => anyhow::bail!("GitHub can't cancel a single job (only the whole run)"),
+            Play => anyhow::bail!("GitHub Actions has no manual job trigger (use workflow_dispatch)"),
         }
     }
 

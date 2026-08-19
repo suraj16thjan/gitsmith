@@ -181,7 +181,7 @@ fn context_keys(app: &App) -> Vec<(&'static str, &'static str)> {
         return vec![("j/k", "scroll"), ("G", "follow"), ("q", "close")];
     }
     if app.jobs_view.is_some() {
-        return vec![("Enter", "log"), ("r", "retry"), ("d", "cancel"), ("q", "close")];
+        return vec![("Enter", "log"), ("r", "retry"), ("d", "cancel"), ("p", "play manual"), ("q", "close")];
     }
     if app.diff.is_some() {
         return vec![("j/k", "scroll"), ("[ ]", "prev/next file"), ("a/M/c", "act"), ("q", "close")];
@@ -816,7 +816,7 @@ fn render_jobs(f: &mut Frame, area: Rect, app: &App) {
     } else if let Some(e) = &jv.error {
         format!("{} — error: {e}", jv.title)
     } else {
-        format!("{}  ·  {} jobs  ·  Enter log · r retry · d cancel · q close", jv.title, jv.jobs.len())
+        format!("{}  ·  {} jobs  ·  Enter log · r retry · d cancel · p play · q close", jv.title, jv.jobs.len())
     };
     let inner = overlay_frame(f, area, &title, theme().accent);
 
@@ -1234,7 +1234,7 @@ fn render_help(f: &mut Frame, area: Rect, app: &App) {
                 ("n", "new MR/PR, issue, member, pipeline, or tag — on those tabs"),
                 ("a  M  c", "approve · merge · close (MRs/PRs)"),
                 ("c  O  C", "close · reopen · comment (Issues)"),
-                ("r  d", "retry · cancel (Pipelines, and jobs inside one)"),
+                ("r  d  p", "retry · cancel · play manual (Pipelines, and jobs inside one)"),
                 ("y  n", "confirm / cancel the [y/n] prompt"),
             ],
         ),

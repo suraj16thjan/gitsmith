@@ -268,6 +268,7 @@ fn glab_job_act_path(enc_project: &str, job_id: &str, action: crate::backend::Jo
     let verb = match action {
         crate::backend::JobAction::Retry => "retry",
         crate::backend::JobAction::Cancel => "cancel",
+        crate::backend::JobAction::Play => "play",
     };
     format!("projects/{enc_project}/jobs/{job_id}/{verb}")
 }
@@ -768,5 +769,6 @@ mod tests {
         assert_eq!(glab_job_trace_path("g%2Fr", "88"), "projects/g%2Fr/jobs/88/trace");
         assert_eq!(glab_job_act_path("g%2Fr", "88", Retry), "projects/g%2Fr/jobs/88/retry");
         assert_eq!(glab_job_act_path("g%2Fr", "88", Cancel), "projects/g%2Fr/jobs/88/cancel");
+        assert_eq!(glab_job_act_path("g%2Fr", "88", Play), "projects/g%2Fr/jobs/88/play");
     }
 }

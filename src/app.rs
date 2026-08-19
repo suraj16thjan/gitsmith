@@ -126,13 +126,16 @@ pub struct NewItemForm {
     pub option_sel: usize,
     pub submitting: bool,
     pub error: Option<String>,
+    /// Pipeline forms fetch branches and tags concurrently — these track arrival.
+    pub branches_done: bool,
+    pub tags_done: bool,
 }
 
 impl NewItemForm {
     const MR_FIELDS: [&'static str; 4] = ["Source branch", "Target branch", "Title", "Description"];
     const ISSUE_FIELDS: [&'static str; 2] = ["Title", "Description"];
     const MEMBER_FIELDS: [&'static str; 2] = ["Username", "Role"];
-    const PIPELINE_FIELDS: [&'static str; 1] = ["Branch"];
+    const PIPELINE_FIELDS: [&'static str; 1] = ["Branch / Tag"];
     const TAG_FIELDS: [&'static str; 2] = ["Tag name", "Branch"];
 
     pub fn fields(&self) -> &'static [&'static str] {
@@ -360,9 +363,14 @@ impl App {
             option_sel: 0,
             submitting: false,
             error: None,
+            branches_done: false,
+            tags_done: false,
         });
         if loading {
             fetch::spawn_branches(self.backend.clone(), self.tx.clone());
+            if kind == NewKind::Pipeline {
+                fetch::spawn_tags(self.backend.clone(), self.tx.clone());
+            }
         }
     }
 
@@ -934,9 +942,30 @@ impl App {
             },
             Msg::Branches { result } => {
                 if let Some(form) = self.new_item.as_mut() {
-                    form.options_loading = false;
                     // A failed branch list isn't fatal — the field is still typeable.
-                    form.options = result.unwrap_or_default();
+                    let branches = result.unwrap_or_default();
+                    if form.kind == NewKind::Pipeline {
+                        // Pipeline forms receive both branches and tags — extend
+                        // so neither message overwrites the other regardless of
+                        // arrival order.
+                        form.options.extend(branches);
+                        form.branches_done = true;
+                        if form.tags_done {
+                            form.options_loading = false;
+                        }
+                    } else {
+                        form.options = branches;
+                        form.options_loading = false;
+                    }
+                }
+            }
+            Msg::Tags { result } => {
+                if let Some(form) = self.new_item.as_mut() {
+                    form.options.extend(result.unwrap_or_default());
+                    form.tags_done = true;
+                    if form.branches_done {
+                        form.options_loading = false;
+                    }
                 }
             }
             Msg::Created { result } => match result {
@@ -1500,6 +1529,15 @@ impl App {
                     self.confirm_job(JobAction::Cancel, &job.id);
                 }
             }
+            KeyCode::Char('p') => {
+                if let Some(job) = sel {
+                    if job.status == "manual" {
+                        self.confirm_job(JobAction::Play, &job.id);
+                    } else {
+                        self.flash = Some(format!("job #{} is {} — only manual jobs can be played", job.id, job.status));
+                    }
+                }
+            }
             _ => {}
         }
     }
@@ -1993,8 +2031,8 @@ mod tests {
         a.handle_key(KeyEvent::from(KeyCode::Char('n')));
         let form = a.new_item.as_ref().expect("form opens on Pipelines");
         assert_eq!(form.kind, NewKind::Pipeline);
-        assert_eq!(form.fields(), ["Branch"]);
-        assert!(form.options_loading, "branches load for the dropdown");
+        assert_eq!(form.fields(), ["Branch / Tag"]);
+        assert!(form.options_loading, "branches and tags load for the dropdown");
         // nothing is required: an empty branch means the default branch
         a.handle_key(KeyEvent::from(KeyCode::Enter));
         assert!(a.new_item.as_ref().unwrap().submitting, "an empty branch submits");
